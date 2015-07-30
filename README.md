@@ -51,9 +51,11 @@ AND
     waiting.pid <> other.pid
 ```
 
-Each row in the `pg_locks` view represents a Postgresql backend process either
-holding or attempting to take a lock.  Processes holding or attempting to take
-multiple locks may appear multiple times in the view.
+[Each row in the pg_locks
+view](http://www.postgresql.org/docs/9.2/static/view-pg-locks.html) represents a
+Postgresql backend process either holding or attempting to take a lock.
+Processes holding or attempting to take multiple locks may appear multiple times
+in the view.
 
 The query above essentially selects all pairs of rows from "pg\_locks" that are
 operating on the same lock, and then joins that information with the
