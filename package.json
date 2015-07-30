@@ -1,0 +1,17 @@
+{
+	"name": "pglockanalyze",
+	"description": "anzlye postgres locking behavior",
+	"version": "0.1.0",
+	"main": "./pglockanalyze",
+	"repository": {
+		"type": "git",
+		"url": "git://github.com/joyent/pglockanalyze.git"
+	},
+	"dependencies": {
+	    "lstream": "0.0.4"
+	},
+	"scripts": {
+		"test": "make test"
+	},
+	"license": "MIT"
+}

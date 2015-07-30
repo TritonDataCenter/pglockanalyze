@@ -1,0 +1,346 @@
+#!/usr/bin/env node
+/* vim: set ft=javascript: */
+
+/*
+ * pglockanalyze.js: given information about postgres locks, report a summary of
+ * the blocked queries.  See README for details on input format and what this
+ * tool attempts to report.
+ */
+
+var mod_assert = require('assert');
+var mod_lstream = require('lstream');
+
+
+/*
+ * List of named fields for each input row.  This is auto-configured from the
+ * first input row, which is assumed to contain the header.
+ */
+var fields = [];
+
+/*
+ * For each of the fields in "fields":
+ *
+ *     h2i[field] denotes the character offset into each line where that field's
+ *                value starts.
+ *
+ *     h2w[field] denotes the length (in characters) for this field's value
+ *
+ * This is auto-configured from the first input row.
+ */
+var h2i = {};	/* header names to index */
+var h2w = {};	/* header names to field width */
+
+/*
+ * Lock information, by pid.  These pids denote separate postgres backends.
+ * This is only used in "summarize" mode (the default).  By the time we're done,
+ * each object in "pids" will contain properties:
+ *
+ *    blocking:   array of rows that THIS pid is contending with.  If this pid
+ *                holds the lock, and the lock types conflict, then that means
+ *                this pid is blocking that pid.
+ *
+ *    blocked_by: array of rows that this PID is potentially blocked by.
+ *
+ * This data structure does not know anything about Postgresql's lock semantics.
+ * It doesn't know, for example, that some locks don't conflict, so it may
+ * report false conflicts.  This is really just a first cut at matching up rows
+ * in the input stream.
+ */
+var pids = {};
+
+/*
+ * Count of rows we've seen so far.
+ */
+var nrows = 0;
+
+/*
+ * Parser state.
+ *
+ * The input file has the general form:
+ *
+ *     header row
+ *     ---------
+ *     data row 1
+ *     data row 2
+ *     ...
+ *     ---------
+ *     potentially extra rows
+ *
+ * We maintain a very simple parser with states:
+ *
+ *    init		we have not yet seen the first row
+ *    ignoreLineTwo	we have seen the header, but not the separator row
+ *    data		we have seen 0 or more data rows, but not the final
+ *    			separator row
+ *    done		we have seen the final separator row and should ignore
+ *    			all future rows
+ *
+ * Each time we see an input line, we call the function for the current state.
+ * That state function returns the new state (which may be the same state).
+ */
+var state = 'init';
+var stateFuncs = {
+    'init': gotRowHeader,
+    'ignoreLineTwo': gotRowIgnoreLineTwo,
+    'data': gotRowData,
+    'done': gotRowDone
+};
+
+/*
+ * We support two modes ("actions"):
+ *
+ *     summarize	produce a report summarizing lock dependencies
+ *
+ *     json		translate the SQL input into JSON output for subsequent
+ *     			querying using other tools like json(1)
+ */
+var action = 'summarize';
+
+/*
+ * If true, ignore input rows where the lock is wanted, but not held.  This can
+ * be a useful knob while exploring the lock data.
+ */
+var ignoreWanted = false;
+
+function main()
+{
+	var lstream = new mod_lstream();
+	process.stdin.pipe(lstream);
+	lstream.on('data', gotRow);
+	lstream.on('end', gotEnd);
+
+	if (process.argv[2] == 'json')
+		action = 'json';
+}
+
+function gotRow(line)
+{
+	var nextstate;
+
+	nrows++;
+	nextstate = (stateFuncs[state])(line);
+	if (!stateFuncs.hasOwnProperty(nextstate)) {
+		console.error('BAD STATE TRANSITION AFTER ROW ', nrows);
+		console.error('previous state: ', state);
+		console.error('next state: ', nextstate);
+		throw (new Error('bad state transition'));
+	}
+
+	state = nextstate;
+}
+
+function gotRowHeader(line)
+{
+	var f, label, i, p;
+
+	/*
+	 * Configure the list of field names, offsets, and widths based on the
+	 * header row.  This should only be called for the first row.
+	 */
+	mod_assert.equal(nrows, 1);
+	f = line.split('|');
+	p = 0;
+	for (i = 0; i < f.length; i++) {
+		/* Chop leading and trailing whitespace. */
+		label = f[i].trim();
+		fields.push(label);
+
+		/*
+		 * Chop the leading and trailing space from each entry.
+		 */
+		h2i[label] = p + 1;
+		h2w[label] = f[i].length - 2;
+		p += f[i].length + 1;
+	}
+
+	/*
+	 * After this row, we ignore the next row.
+	 */
+	return ('ignoreLineTwo');
+}
+
+function gotRowIgnoreLineTwo(line)
+{
+	/*
+	 * This should only be called for line 2, and we just transition the
+	 * parser to the next state.
+	 */
+	mod_assert.equal(nrows, 2);
+	return ('data');
+}
+
+function gotRowData(line)
+{
+	var obj;
+
+	mod_assert.ok(nrows > 2);
+
+	/*
+	 * If we see a row without field separators, then we're done.  This is
+	 * the final separator row.
+	 */
+	if (line.indexOf('|') == -1) {
+		return ('done');
+	}
+
+	/*
+	 * Construct a JavaScript object based on the field names defined in the
+	 * header line and the values in this line.
+	 */
+	obj = {};
+	fields.forEach(function (field) {
+		obj[field] = extractField(line, field);
+	});
+
+	/*
+	 * It's useful to group similar queries by "kind", so we pull out this
+	 * synthetic field.
+	 */
+	obj.waiting_query_kind = queryKind(obj.waiting_query);
+	obj.other_query_kind = queryKind(obj.other_query);
+
+	/*
+	 * If we're just transforming to JSON, then just spit out the object we
+	 * constructed.
+	 */
+	if (action == 'json') {
+		console.log(JSON.stringify(obj));
+		return (state);
+	}
+
+	mod_assert.equal(action, 'summarize');
+	if (ignoreWanted && obj.other_granted == 'f') {
+		return (state);
+	}
+
+	/*
+	 * Build up an object to keep track of which pids may be waiting on
+	 * which locks from other pids.  See the comments at the top of this
+	 * file for details on this structure and its semantics.
+	 */
+	if (!pids.hasOwnProperty(obj.waiting_pid)) {
+		pids[obj.waiting_pid] = {
+		    'blocking': [],
+		    'blocked_on': []
+		};
+	}
+
+	if (!pids.hasOwnProperty(obj.other_pid)) {
+		pids[obj.other_pid] = {
+		    'blocking': [],
+		    'blocked_on': []
+		};
+	}
+
+	pids[obj.waiting_pid].blocked_on.push(obj);
+	pids[obj.other_pid].blocking.push(obj);
+
+	/*
+	 * Assume we may have more rows.  Don't change the parser state.
+	 */
+	return (state);
+}
+
+function gotRowDone(line)
+{
+	/*
+	 * If we get a new line after we think we're done, ignore it, and don't
+	 * change the parser state.
+	 */
+	return (state);
+}
+
+/*
+ * Given a line and named field "field", extract the value of "field" from this
+ * line.  We use the offset and width configured from the header row, and we
+ * trim whitespace on the ends.
+ */
+function extractField(line, field)
+{
+	return (line.substr(h2i[field], h2w[field]).trim());
+}
+
+/*
+ * Given a query string, return what "kind" of query it is.  This is used for
+ * grouping similar queries.  For now, we use the first keyword in the query as
+ * the kind.
+ */
+function queryKind(query)
+{
+	var p;
+
+	p = query.indexOf(' ');
+	if (p == -1) {
+		p = query.length;
+	}
+
+	return (query.substr(0, p));
+}
+
+/*
+ * When we reach the end of the stream, if we're in "summarize" mode, print out
+ * a report of lock dependencies.
+ */
+function gotEnd()
+{
+	var pidkeys;
+
+	if (action == 'json')
+		return;
+
+	pidkeys = Object.keys(pids);
+	pidkeys.sort(function (p1, p2) {
+		return (pids[p1].blocking.length - pids[p2].blocking.length);
+	});
+	pidkeys.forEach(function (p1) {
+		reportPid(p1);
+	});
+}
+
+/*
+ * For pid "p", print out what other pids it may be blocking.
+ */
+function reportPid(p)
+{
+	var info, locksheld;
+	var heldkinds, blockedkinds;
+
+	/*
+	 * Don't print out anything for pids that aren't potentially blocking
+	 * any other pids.
+	 */
+	info = pids[p];
+	if (info.blocking.length === 0) {
+		return;
+	}
+
+	locksheld = {};
+
+	info.blocking.forEach(function (bi) {
+		var lockname =
+		    (bi.other_granted == 't' ? 'holds ' : 'wants ') +
+		    bi.other_mode;
+		var lockblocking = bi.waiting_mode;
+
+		mod_assert.equal(bi.other_pid, p);
+		if (!locksheld.hasOwnProperty(lockname))
+			locksheld[lockname] = {};
+		if (!locksheld[lockname].hasOwnProperty(lockblocking))
+			locksheld[lockname][lockblocking] = [];
+		locksheld[lockname][lockblocking].push(bi.waiting_pid);
+	});
+
+	console.log('pid %s: query: %s', p, info.blocking[0].other_query);
+	heldkinds = Object.keys(locksheld).sort();
+	heldkinds.forEach(function (heldkind) {
+		blockedkinds = Object.keys(locksheld[heldkind]).sort();
+		blockedkinds.forEach(function (blockedkind) {
+			console.log('    %s: may contend with %d pids ' +
+			    'wanting %s (e.g., %s)', heldkind,
+			    locksheld[heldkind][blockedkind].length,
+			    blockedkind, locksheld[heldkind][blockedkind][0]);
+		});
+	});
+}
+
+main();
