@@ -68,7 +68,13 @@ example, the pids in a given row may both be attempting to take a shared
 (non-exclusive) lock on a table, in which case it's not a problem that they're
 both contending for it.
 
-pganalyze takes on stdin the textual output you'd get by running this query
+## Using pglockanalyze
+
+pglockanalyze is a Node.js program.  You install it with:
+
+    $ npm install -g pglockanalyze
+
+pglockanalyze takes on stdin the textual output you'd get by running this query
 using psql(1), and produces on stdout a report like this:
 
     $ psql -c "..." > query.out
